@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Malware Checker</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <main>
+    <h1>Malware Checker</h1>
+    <p id="health">Checking scanner status...</p>
+
+    <input id="fileInput" type="file" />
+    <button id="scanBtn" disabled>Scan</button>
+
+    <p id="selectedFile">No file selected.</p>
+    <p id="progress" class="hidden">Scanning...</p>
+
+    <section id="result" class="hidden"></section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

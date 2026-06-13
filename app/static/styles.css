@@ -1,0 +1,44 @@
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: #000;
+  color: #fff;
+  font-family: monospace;
+  font-size: 16px;
+}
+
+main {
+  padding: 24px;
+}
+
+button,
+input {
+  background: #000;
+  color: #fff;
+  border: 1px solid #fff;
+  padding: 8px;
+  font-family: monospace;
+}
+
+button:disabled {
+  opacity: 0.5;
+}
+
+.hidden {
+  display: none;
+}
+
+#result {
+  margin-top: 24px;
+  border-top: 1px solid #fff;
+  padding-top: 16px;
+}
+
+pre {
+  white-space: pre-wrap;
+  word-break: break-word;
+  border: 1px solid #fff;
+  padding: 12px;
+  overflow-x: auto;
+}
