@@ -1,0 +1,32 @@
+services:
+  clamav:
+    image: clamav/clamav:latest
+    container_name: malware-checker-clamav
+    restart: unless-stopped
+    volumes:
+      - clamav-db:/var/lib/clamav
+      - uploads:/uploads:ro
+    expose:
+      - "3310"
+
+  web:
+    build: .
+    container_name: malware-checker-web
+    restart: unless-stopped
+    ports:
+      - "8088:8080"
+    environment:
+      - CLAMAV_HOST=clamav
+      - CLAMAV_PORT=3310
+      - MAX_UPLOAD_MB=102400
+      - UPLOAD_DIR=/uploads
+      - EXTRACT_TIMEOUT_SECONDS=7200
+      - SCAN_SOCKET_TIMEOUT_SECONDS=600
+    volumes:
+      - uploads:/uploads
+    depends_on:
+      - clamav
+
+volumes:
+  clamav-db:
+  uploads:
