@@ -53,8 +53,10 @@ function isRunning(status) {
   return ["queued", "extracting", "scanning"].includes(status);
 }
 
-function renderResult(data, titlePrefix = "Current scan") {
+function renderResult(data, titlePrefix = "Current scan", openTerminalIds = new Set()) {
   const output = data.terminal_output || data.raw || "";
+  const terminalId = data.scan_id || data.id || "current";
+  const terminalOpen = openTerminalIds.has(terminalId);
 
   return `
     <h2>${escapeHtml(titlePrefix)}: ${escapeHtml(label(data.status))}</h2>
@@ -74,7 +76,7 @@ function renderResult(data, titlePrefix = "Current scan") {
     <p>Message: ${escapeHtml(data.message || "")}</p>
     <p>Note: ${escapeHtml(data.note || "")}</p>
 
-    <details>
+    <details data-terminal-id="${escapeHtml(terminalId)}" ${terminalOpen ? "open" : ""}>
       <summary>Terminal output</summary>
       <pre>${escapeHtml(output)}</pre>
     </details>
@@ -88,6 +90,13 @@ function getOpenHistoryIds() {
   );
 }
 
+function getOpenTerminalIds() {
+  return new Set(
+    [...historyBox.querySelectorAll("details[data-terminal-id][open]")]
+      .map((details) => details.dataset.terminalId)
+  );
+}
+
 function renderHistory(records) {
   if (!records.length) {
     historyBox.innerHTML = "<p>No previous scans.</p>";
@@ -95,6 +104,7 @@ function renderHistory(records) {
   }
 
   const openIds = getOpenHistoryIds();
+  const openTerminalIds = getOpenTerminalIds();
 
   historyBox.innerHTML = records.map((record) => {
     const runningClass = isRunning(record.status) ? " status-running" : "";
@@ -109,7 +119,7 @@ function renderHistory(records) {
             ${formatBytes(record.size_bytes)} |
             ${escapeHtml(record.created_at)}
           </summary>
-          ${renderResult(record, "Previous scan")}
+          ${renderResult(record, "Previous scan", openTerminalIds)}
         </details>
       </article>
     `;
