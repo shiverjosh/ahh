@@ -6,7 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends p7zip-full \
+    && apt-get install -y --no-install-recommends p7zip-full unar \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /app/requirements.txt
@@ -14,7 +14,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app /app/app
 
-RUN mkdir -p /uploads && chmod 777 /uploads
+RUN mkdir -p /uploads /data && chmod 777 /uploads /data
 
 EXPOSE 8080
 

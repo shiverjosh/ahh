@@ -20,13 +20,16 @@ services:
       - CLAMAV_PORT=3310
       - MAX_UPLOAD_MB=102400
       - UPLOAD_DIR=/uploads
+      - DATA_DIR=/data
       - EXTRACT_TIMEOUT_SECONDS=7200
       - SCAN_SOCKET_TIMEOUT_SECONDS=600
     volumes:
       - uploads:/uploads
+      - scan-data:/data
     depends_on:
       - clamav
 
 volumes:
   clamav-db:
   uploads:
+  scan-data:

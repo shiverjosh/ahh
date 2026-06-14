@@ -1,27 +1,21 @@
-# Malware Checker v2
+# Malware Checker v3
 
-Plain black-and-white self-hosted malware checker.
+Plain black-and-white self-hosted malware checker with scan history.
 
-## What changed
+## Features
+
+- Clear all saved scan records from the web UI
 
 - Black page with white text only
 - Extracts archives first, then scans extracted files one by one
+- Detects `.rar` by original filename and sends it straight to unar
+- Uses 7z first only for non-RAR archives, then falls back to unar
 - Supports archive extensions like `.rar`, `.7z`, `.zip`, `.tar`, `.gz`, `.iso`
-- Shows terminal-style extraction and scan output
+- Shows terminal output in dropdowns
+- Stores previous scan records in SQLite
+- Does NOT store uploaded files
 - Deletes uploaded and extracted files after scan
-- Honest statuses:
-  - CLEAN
-  - INFECTED
-  - SCAN INCOMPLETE
-  - SCAN FAILED
-
-## Why extraction mode exists
-
-ClamAV cannot reliably fully scan individual files larger than around 2GB.
-
-For a large RAR/7z/zip, this app extracts the archive first and scans the extracted files individually.
-
-If an extracted file is still over 2GB, the app marks the result as SCAN INCOMPLETE.
+- Persistent history using Docker volume `scan-data`
 
 ## Run
 
@@ -35,6 +29,19 @@ Open:
 http://localhost:8088
 ```
 
+## Stored data
+
+Only scan records are stored:
+
+- filename
+- size
+- scan result
+- terminal output
+- timestamp
+- scan counts
+
+The actual uploaded file and extracted files are deleted after each scan.
+
 ## Portainer
 
 Use this folder or Git repo as a Portainer Git stack.
@@ -44,10 +51,3 @@ Compose path:
 ```text
 docker-compose.yml
 ```
-
-## Notes
-
-- You need enough free disk space for the upload and extracted contents.
-- Password-protected archives may fail or only partially extract.
-- RAR support depends on the 7z package available in the container.
-- Do not expose this directly to the internet without authentication.
