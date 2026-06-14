@@ -13,11 +13,15 @@
 
     <input id="fileInput" type="file" />
     <button id="scanBtn" disabled>Scan</button>
+    <button id="clearBtn">Clear all saved records</button>
 
     <p id="selectedFile">No file selected.</p>
     <p id="progress" class="hidden">Scanning...</p>
 
-    <section id="result" class="hidden"></section>
+    <section id="currentResult" class="hidden"></section>
+
+    <h2>Previous scans</h2>
+    <section id="history"></section>
   </main>
 
   <script src="/static/app.js"></script>
