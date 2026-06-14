@@ -78,7 +78,7 @@ function renderResult(data, titlePrefix = "Current scan", openTerminalIds = new 
 
     <details data-terminal-id="${escapeHtml(terminalId)}" ${terminalOpen ? "open" : ""}>
       <summary>Terminal output</summary>
-      <pre>${escapeHtml(output)}</pre>
+      <pre data-terminal-output-id="${escapeHtml(terminalId)}">${escapeHtml(output)}</pre>
     </details>
   `;
 }
@@ -97,6 +97,22 @@ function getOpenTerminalIds() {
   );
 }
 
+function getTerminalScrollPositions() {
+  return new Map(
+    [...historyBox.querySelectorAll("pre[data-terminal-output-id]")]
+      .map((pre) => [pre.dataset.terminalOutputId, pre.scrollTop])
+  );
+}
+
+function restoreTerminalScrollPositions(scrollPositions) {
+  for (const [terminalId, scrollTop] of scrollPositions.entries()) {
+    const pre = historyBox.querySelector(`pre[data-terminal-output-id="${CSS.escape(terminalId)}"]`);
+    if (pre) {
+      pre.scrollTop = scrollTop;
+    }
+  }
+}
+
 function renderHistory(records) {
   if (!records.length) {
     historyBox.innerHTML = "<p>No previous scans.</p>";
@@ -105,6 +121,7 @@ function renderHistory(records) {
 
   const openIds = getOpenHistoryIds();
   const openTerminalIds = getOpenTerminalIds();
+  const terminalScrollPositions = getTerminalScrollPositions();
 
   historyBox.innerHTML = records.map((record) => {
     const runningClass = isRunning(record.status) ? " status-running" : "";
@@ -124,6 +141,8 @@ function renderHistory(records) {
       </article>
     `;
   }).join("");
+
+  restoreTerminalScrollPositions(terminalScrollPositions);
 }
 
 async function loadHistory() {
