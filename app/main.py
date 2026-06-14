@@ -1,9 +1,12 @@
+import json
 import os
 import shutil
 import socket
+import sqlite3
 import subprocess
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -15,14 +18,12 @@ CLAMAV_HOST = os.getenv("CLAMAV_HOST", "clamav")
 CLAMAV_PORT = int(os.getenv("CLAMAV_PORT", "3310"))
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "102400"))
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "/uploads"))
+DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
 
 EXTRACT_TIMEOUT_SECONDS = int(os.getenv("EXTRACT_TIMEOUT_SECONDS", "7200"))
 SCAN_SOCKET_TIMEOUT_SECONDS = int(os.getenv("SCAN_SOCKET_TIMEOUT_SECONDS", "600"))
 
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
-
-# ClamAV cannot reliably fully scan individual files larger than ~2GB.
-# Large archives are extracted first; extracted files over this size are skipped and reported.
 CLAMAV_INDIVIDUAL_FILE_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
 
 ARCHIVE_EXTENSIONS = {
@@ -34,6 +35,124 @@ app = FastAPI(title="Malware Checker")
 
 static_dir = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
+
+
+def db_path() -> Path:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    return DATA_DIR / "scan_history.sqlite3"
+
+
+def get_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path())
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db() -> None:
+    with get_db() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scans (
+                id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                message TEXT NOT NULL,
+                fully_scanned INTEGER NOT NULL,
+                archive_detected INTEGER NOT NULL,
+                scan_mode TEXT NOT NULL,
+                files_extracted INTEGER NOT NULL,
+                files_scanned INTEGER NOT NULL,
+                files_skipped_large INTEGER NOT NULL,
+                deleted_after_scan INTEGER NOT NULL,
+                terminal_output TEXT NOT NULL,
+                extra_json TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+
+
+@app.on_event("startup")
+def on_startup() -> None:
+    init_db()
+
+
+def save_scan_record(result: dict) -> str:
+    scan_id = uuid.uuid4().hex
+    created_at = datetime.now(timezone.utc).isoformat()
+
+    extra = {
+        "threat": result.get("threat", ""),
+        "threats": result.get("threats", []),
+        "limited": result.get("limited", []),
+        "failed": result.get("failed", []),
+        "note": result.get("note", ""),
+    }
+
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO scans (
+                id, created_at, filename, size_bytes, status, message,
+                fully_scanned, archive_detected, scan_mode,
+                files_extracted, files_scanned, files_skipped_large,
+                deleted_after_scan, terminal_output, extra_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                scan_id,
+                created_at,
+                result.get("filename", "unknown"),
+                int(result.get("size_bytes", 0)),
+                result.get("status", "unknown"),
+                result.get("message", ""),
+                1 if result.get("fully_scanned") else 0,
+                1 if result.get("archive_detected") else 0,
+                result.get("scan_mode", "unknown"),
+                int(result.get("files_extracted", 0) or 0),
+                int(result.get("files_scanned", 0) or 0),
+                int(result.get("files_skipped_large", 0) or 0),
+                1 if result.get("deleted_after_scan") else 0,
+                result.get("terminal_output", ""),
+                json.dumps(extra),
+            ),
+        )
+        conn.commit()
+
+    return scan_id
+
+
+def row_to_record(row: sqlite3.Row, include_terminal: bool = False) -> dict:
+    extra = json.loads(row["extra_json"] or "{}")
+
+    record = {
+        "id": row["id"],
+        "created_at": row["created_at"],
+        "filename": row["filename"],
+        "size_bytes": row["size_bytes"],
+        "status": row["status"],
+        "message": row["message"],
+        "fully_scanned": bool(row["fully_scanned"]),
+        "archive_detected": bool(row["archive_detected"]),
+        "scan_mode": row["scan_mode"],
+        "files_extracted": row["files_extracted"],
+        "files_scanned": row["files_scanned"],
+        "files_skipped_large": row["files_skipped_large"],
+        "deleted_after_scan": bool(row["deleted_after_scan"]),
+        "threat": extra.get("threat", ""),
+        "note": extra.get("note", ""),
+    }
+
+    if include_terminal:
+        record["terminal_output"] = row["terminal_output"]
+        record["threats"] = extra.get("threats", [])
+        record["limited"] = extra.get("limited", [])
+        record["failed"] = extra.get("failed", [])
+
+    return record
 
 
 def safe_display_name(filename: Optional[str]) -> str:
@@ -49,6 +168,13 @@ def is_archive(filename: Optional[str]) -> bool:
     if lower.endswith((".tar.gz", ".tar.bz2", ".tar.xz")):
         return True
     return Path(lower).suffix in ARCHIVE_EXTENSIONS
+
+
+def is_rar_archive(filename: Optional[str]) -> bool:
+    if not filename:
+        return False
+    lower = filename.lower()
+    return lower.endswith(".rar")
 
 
 def wait_for_clamav(timeout_seconds: int = 3) -> bool:
@@ -111,11 +237,9 @@ def verify_extracted_paths_are_safe(extract_dir: Path) -> tuple[bool, str]:
     return True, ""
 
 
-def extract_archive(archive_path: Path, extract_dir: Path) -> dict:
-    extract_dir.mkdir(parents=True, exist_ok=True)
 
-    command = ["7z", "x", "-y", f"-o{extract_dir}", str(archive_path)]
 
+def run_extractor(command: list[str], label: str) -> dict:
     try:
         completed = subprocess.run(
             command,
@@ -129,34 +253,108 @@ def extract_archive(archive_path: Path, extract_dir: Path) -> dict:
         stderr = exc.stderr if isinstance(exc.stderr, str) else ""
         return {
             "ok": False,
+            "exit_code": -1,
             "output": "\n".join([
-                "$ " + " ".join(command),
+                f"$ {' '.join(command)}",
+                "",
+                f"========== {label} STDOUT ==========",
                 stdout,
+                "",
+                f"========== {label} STDERR ==========",
                 stderr,
+                "",
                 "ERROR: Archive extraction timed out.",
             ]).strip(),
         }
 
     output = "\n".join([
-        "$ " + " ".join(command),
+        f"$ {' '.join(command)}",
         "",
-        "========== 7Z STDOUT ==========",
+        f"========== {label} STDOUT ==========",
         completed.stdout or "",
         "",
-        "========== 7Z STDERR ==========",
+        f"========== {label} STDERR ==========",
         completed.stderr or "",
         "",
         f"Exit code: {completed.returncode}",
     ]).strip()
 
-    if completed.returncode != 0:
-        return {"ok": False, "output": output}
+    return {
+        "ok": completed.returncode == 0,
+        "exit_code": completed.returncode,
+        "output": output,
+    }
 
+
+def finish_extraction_check(extract_dir: Path, output: str) -> dict:
     safe, reason = verify_extracted_paths_are_safe(extract_dir)
     if not safe:
-        return {"ok": False, "output": output + "\n\nSECURITY ERROR: " + reason}
+        return {
+            "ok": False,
+            "output": output + "\n\nSECURITY ERROR: " + reason,
+        }
 
-    return {"ok": True, "output": output}
+    return {
+        "ok": True,
+        "output": output,
+    }
+
+
+def extract_archive(archive_path: Path, extract_dir: Path, original_filename: str = "") -> dict:
+    extract_dir.mkdir(parents=True, exist_ok=True)
+
+    # RAR files go straight to unar instead of trying 7z first.
+    if is_rar_archive(original_filename):
+        unar_command = ["unar", "-force-overwrite", "-o", str(extract_dir), str(archive_path)]
+        unar = run_extractor(unar_command, "UNAR")
+
+        output = "\n\n".join([
+            "========== RAR DETECTED ==========",
+            "Original filename ends with .rar, so this scan used unar directly.",
+            "",
+            "========== EXTRACTOR: UNAR ==========",
+            unar["output"],
+        ])
+
+        if not unar["ok"]:
+            return {
+                "ok": False,
+                "output": output + "\n\nERROR: unar failed to fully extract the RAR archive.",
+            }
+
+        return finish_extraction_check(extract_dir, output)
+
+    # Non-RAR archives use 7z first, then unar fallback.
+    all_output = []
+
+    seven_zip_command = ["7z", "x", "-y", f"-o{extract_dir}", str(archive_path)]
+    seven_zip = run_extractor(seven_zip_command, "7Z")
+    all_output.append("========== EXTRACTOR ATTEMPT 1: 7Z ==========")
+    all_output.append(seven_zip["output"])
+
+    if seven_zip["ok"]:
+        return finish_extraction_check(extract_dir, "\n\n".join(all_output))
+
+    # Clean partial files before fallback so we do not scan incomplete extraction output.
+    try:
+        shutil.rmtree(extract_dir, ignore_errors=True)
+        extract_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    unar_command = ["unar", "-force-overwrite", "-o", str(extract_dir), str(archive_path)]
+    unar = run_extractor(unar_command, "UNAR")
+    all_output.append("")
+    all_output.append("========== EXTRACTOR ATTEMPT 2: UNAR ==========")
+    all_output.append(unar["output"])
+
+    if not unar["ok"]:
+        return {
+            "ok": False,
+            "output": "\n\n".join(all_output) + "\n\nERROR: Both 7z and unar failed to fully extract the archive.",
+        }
+
+    return finish_extraction_check(extract_dir, "\n\n".join(all_output))
 
 
 def scan_regular_file(file_path: Path) -> dict:
@@ -211,7 +409,7 @@ def scan_regular_file(file_path: Path) -> dict:
     }
 
 
-def scan_extracted_archive(archive_path: Path, extract_dir: Path) -> dict:
+def scan_extracted_archive(archive_path: Path, extract_dir: Path, original_filename: str = "") -> dict:
     lines = [
         "========== SCAN MODE ==========",
         "Archive extraction scan",
@@ -219,7 +417,7 @@ def scan_extracted_archive(archive_path: Path, extract_dir: Path) -> dict:
         "========== EXTRACTION OUTPUT ==========",
     ]
 
-    extraction = extract_archive(archive_path, extract_dir)
+    extraction = extract_archive(archive_path, extract_dir, original_filename)
     lines.append(extraction["output"])
 
     if not extraction["ok"]:
@@ -289,7 +487,7 @@ def scan_extracted_archive(archive_path: Path, extract_dir: Path) -> dict:
         if result["status"] in {"clean", "infected"}:
             scanned_count += 1
 
-    fully_scanned = not infected and not limited and not failed and skipped_large_count == 0
+    fully_scanned = not limited and not failed and skipped_large_count == 0
 
     if infected:
         status = "infected"
@@ -330,6 +528,9 @@ def scan_extracted_archive(archive_path: Path, extract_dir: Path) -> dict:
         "fully_scanned": fully_scanned,
         "terminal_output": "\n".join(lines),
         "threat": infected[0] if infected else (limited[0] if limited else ""),
+        "threats": infected,
+        "limited": limited,
+        "failed": failed,
         "files_scanned": scanned_count,
         "files_extracted": len(files),
         "files_skipped_large": skipped_large_count,
@@ -349,7 +550,37 @@ def health():
         "clamav": "ok" if wait_for_clamav(timeout_seconds=1) else "not_ready",
         "max_upload_mb": MAX_UPLOAD_MB,
         "archive_extract": "enabled",
+        "history": "enabled",
     }
+
+
+@app.get("/api/scans")
+def list_scans():
+    init_db()
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM scans ORDER BY created_at DESC LIMIT 100"
+        ).fetchall()
+    return {"records": [row_to_record(row, include_terminal=True) for row in rows]}
+
+
+@app.get("/api/scans/{scan_id}")
+def get_scan(scan_id: str):
+    init_db()
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM scans WHERE id = ?", (scan_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Scan record not found.")
+    return row_to_record(row, include_terminal=True)
+
+
+@app.delete("/api/scans")
+def clear_scans():
+    init_db()
+    with get_db() as conn:
+        conn.execute("DELETE FROM scans")
+        conn.commit()
+    return {"ok": True}
 
 
 @app.post("/api/scan")
@@ -389,7 +620,7 @@ async def scan(file: UploadFile = File(...)):
 
         os.chmod(file_path, 0o644)
 
-        result = scan_extracted_archive(file_path, extract_dir) if archive_mode else scan_regular_file(file_path)
+        result = scan_extracted_archive(file_path, extract_dir, display_name) if archive_mode else scan_regular_file(file_path)
 
         result.update({
             "filename": display_name,
@@ -397,10 +628,11 @@ async def scan(file: UploadFile = File(...)):
             "deleted_after_scan": True,
             "archive_detected": archive_mode,
             "note": (
-                "Clean means ClamAV did not detect malware in the files it scanned. "
-                "If fully_scanned is false, one or more files were skipped, limited, or failed."
+                "Only this scan record is stored. The uploaded file and extracted files are deleted after scanning."
             ),
         })
+
+        result["scan_id"] = save_scan_record(result)
 
         return JSONResponse(result)
 
