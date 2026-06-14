@@ -2,7 +2,10 @@ const fileInput = document.getElementById("fileInput");
 const scanBtn = document.getElementById("scanBtn");
 const clearBtn = document.getElementById("clearBtn");
 const selectedFileText = document.getElementById("selectedFile");
+const uploadPanel = document.getElementById("uploadPanel");
 const progress = document.getElementById("progress");
+const uploadBar = document.getElementById("uploadBar");
+const uploadPercent = document.getElementById("uploadPercent");
 const currentResult = document.getElementById("currentResult");
 const historyBox = document.getElementById("history");
 const health = document.getElementById("health");
@@ -35,12 +38,19 @@ function formatBytes(bytes) {
 
 function label(status) {
   return {
+    queued: "QUEUED",
+    extracting: "EXTRACTING",
+    scanning: "SCANNING",
     clean: "CLEAN",
     infected: "INFECTED",
     scan_limited: "SCAN INCOMPLETE",
     scan_failed: "SCAN FAILED",
     error: "ERROR",
   }[status] || "RESULT";
+}
+
+function isRunning(status) {
+  return ["queued", "extracting", "scanning"].includes(status);
 }
 
 function renderResult(data, titlePrefix = "Current scan") {
@@ -59,7 +69,8 @@ function renderResult(data, titlePrefix = "Current scan") {
     <p>Files extracted: ${data.files_extracted ?? 0}</p>
     <p>Files scanned: ${data.files_scanned ?? 0}</p>
     <p>Files skipped large: ${data.files_skipped_large ?? 0}</p>
-    <p>Deleted after scan: ${data.deleted_after_scan ? "Yes" : "Unknown"}</p>
+    <p>Deleted after scan: ${data.deleted_after_scan ? "Yes" : "No / not yet"}</p>
+    <p>SHA256: <span class="small">${escapeHtml(data.sha256 || "not calculated yet")}</span></p>
     <p>Message: ${escapeHtml(data.message || "")}</p>
     <p>Note: ${escapeHtml(data.note || "")}</p>
 
@@ -77,9 +88,10 @@ function renderHistory(records) {
   }
 
   historyBox.innerHTML = records.map((record) => {
+    const runningClass = isRunning(record.status) ? " status-running" : "";
     return `
-      <article class="record">
-        <details>
+      <article class="record${runningClass}">
+        <details ${isRunning(record.status) ? "open" : ""}>
           <summary>
             ${escapeHtml(label(record.status))} |
             ${escapeHtml(record.filename)} |
@@ -103,6 +115,12 @@ async function loadHistory() {
   }
 }
 
+function resetUploadProgress() {
+  uploadBar.style.width = "0%";
+  uploadPercent.textContent = "0%";
+  progress.textContent = "Uploading... keep this tab open until the scan is queued.";
+}
+
 fileInput.addEventListener("change", () => {
   selectedFile = fileInput.files[0] || null;
   scanBtn.disabled = !selectedFile;
@@ -112,57 +130,87 @@ fileInput.addEventListener("change", () => {
     : "No file selected.";
 });
 
-scanBtn.addEventListener("click", async () => {
+scanBtn.addEventListener("click", () => {
   if (!selectedFile) return;
 
-  progress.classList.remove("hidden");
+  resetUploadProgress();
+  uploadPanel.classList.remove("hidden");
   currentResult.classList.add("hidden");
   scanBtn.disabled = true;
 
   const formData = new FormData();
   formData.append("file", selectedFile);
 
-  try {
-    const response = await fetch("/api/scan", {
-      method: "POST",
-      body: formData,
-    });
+  const xhr = new XMLHttpRequest();
+  xhr.open("POST", "/api/scan");
 
-    const data = await response.json();
+  xhr.upload.onprogress = (event) => {
+    if (!event.lengthComputable) return;
 
-    if (!response.ok) {
+    const percent = Math.round((event.loaded / event.total) * 100);
+    uploadBar.style.width = `${percent}%`;
+    uploadPercent.textContent = `${percent}%`;
+
+    if (percent >= 100) {
+      progress.textContent = "Upload complete. Waiting for server to queue the scan...";
+    }
+  };
+
+  xhr.onload = async () => {
+    try {
+      const data = JSON.parse(xhr.responseText || "{}");
+
+      if (xhr.status < 200 || xhr.status >= 300) {
+        currentResult.innerHTML = renderResult({
+          status: "error",
+          filename: selectedFile.name,
+          size_bytes: selectedFile.size,
+          fully_scanned: false,
+          message: data.detail || "Upload or scan failed.",
+          terminal_output: JSON.stringify(data, null, 2),
+        });
+      } else {
+        uploadBar.style.width = "100%";
+        uploadPercent.textContent = "100%";
+        progress.textContent = "Upload finished. Background scan queued. You can close the page now.";
+        currentResult.innerHTML = renderResult(data);
+        await loadHistory();
+      }
+
+      currentResult.classList.remove("hidden");
+    } catch (error) {
       currentResult.innerHTML = renderResult({
         status: "error",
         filename: selectedFile.name,
         size_bytes: selectedFile.size,
         fully_scanned: false,
-        message: data.detail || "Upload or scan failed.",
-        terminal_output: JSON.stringify(data, null, 2),
+        message: error.message,
+        terminal_output: error.stack || error.message,
       });
-    } else {
-      currentResult.innerHTML = renderResult(data);
-      await loadHistory();
+      currentResult.classList.remove("hidden");
+    } finally {
+      scanBtn.disabled = false;
     }
+  };
 
-    currentResult.classList.remove("hidden");
-  } catch (error) {
+  xhr.onerror = () => {
     currentResult.innerHTML = renderResult({
       status: "error",
       filename: selectedFile.name,
       size_bytes: selectedFile.size,
       fully_scanned: false,
-      message: error.message,
-      terminal_output: error.stack || error.message,
+      message: "Upload failed or connection was interrupted.",
+      terminal_output: "The browser upload request failed.",
     });
     currentResult.classList.remove("hidden");
-  } finally {
-    progress.classList.add("hidden");
     scanBtn.disabled = false;
-  }
+  };
+
+  xhr.send(formData);
 });
 
 clearBtn.addEventListener("click", async () => {
-  const ok = confirm("Clear ALL saved scan records? This only deletes the stored reports/history. Uploaded files are already deleted after scanning.");
+  const ok = confirm("Clear ALL saved scan records? This only deletes stored reports/history. Uploaded files are already deleted after scanning.");
   if (!ok) return;
 
   await fetch("/api/scans", { method: "DELETE" });
@@ -184,3 +232,4 @@ async function checkHealth() {
 checkHealth();
 loadHistory();
 setInterval(checkHealth, 10000);
+setInterval(loadHistory, 3000);
