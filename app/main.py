@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import shutil
@@ -10,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -77,19 +78,35 @@ def init_db() -> None:
 @app.on_event("startup")
 def on_startup() -> None:
     init_db()
+    with get_db() as conn:
+        conn.execute(
+            """
+            UPDATE scans
+            SET status = 'scan_failed',
+                message = 'Scan was interrupted because the server restarted before it finished.',
+                fully_scanned = 0,
+                deleted_after_scan = 0
+            WHERE status IN ('queued', 'scanning', 'extracting')
+            """
+        )
+        conn.commit()
 
 
-def save_scan_record(result: dict) -> str:
-    scan_id = uuid.uuid4().hex
-    created_at = datetime.now(timezone.utc).isoformat()
-
+def build_extra_json(result: dict) -> str:
     extra = {
         "threat": result.get("threat", ""),
         "threats": result.get("threats", []),
         "limited": result.get("limited", []),
         "failed": result.get("failed", []),
         "note": result.get("note", ""),
+        "sha256": result.get("sha256", ""),
     }
+    return json.dumps(extra)
+
+
+def save_scan_record(result: dict, scan_id: Optional[str] = None) -> str:
+    scan_id = scan_id or uuid.uuid4().hex
+    created_at = datetime.now(timezone.utc).isoformat()
 
     with get_db() as conn:
         conn.execute(
@@ -117,13 +134,52 @@ def save_scan_record(result: dict) -> str:
                 int(result.get("files_skipped_large", 0) or 0),
                 1 if result.get("deleted_after_scan") else 0,
                 result.get("terminal_output", ""),
-                json.dumps(extra),
+                build_extra_json(result),
             ),
         )
         conn.commit()
 
     return scan_id
 
+
+def update_scan_record(scan_id: str, result: dict) -> None:
+    with get_db() as conn:
+        conn.execute(
+            """
+            UPDATE scans
+            SET filename = ?,
+                size_bytes = ?,
+                status = ?,
+                message = ?,
+                fully_scanned = ?,
+                archive_detected = ?,
+                scan_mode = ?,
+                files_extracted = ?,
+                files_scanned = ?,
+                files_skipped_large = ?,
+                deleted_after_scan = ?,
+                terminal_output = ?,
+                extra_json = ?
+            WHERE id = ?
+            """,
+            (
+                result.get("filename", "unknown"),
+                int(result.get("size_bytes", 0)),
+                result.get("status", "unknown"),
+                result.get("message", ""),
+                1 if result.get("fully_scanned") else 0,
+                1 if result.get("archive_detected") else 0,
+                result.get("scan_mode", "unknown"),
+                int(result.get("files_extracted", 0) or 0),
+                int(result.get("files_scanned", 0) or 0),
+                int(result.get("files_skipped_large", 0) or 0),
+                1 if result.get("deleted_after_scan") else 0,
+                result.get("terminal_output", ""),
+                build_extra_json(result),
+                scan_id,
+            ),
+        )
+        conn.commit()
 
 def row_to_record(row: sqlite3.Row, include_terminal: bool = False) -> dict:
     extra = json.loads(row["extra_json"] or "{}")
@@ -144,6 +200,7 @@ def row_to_record(row: sqlite3.Row, include_terminal: bool = False) -> dict:
         "deleted_after_scan": bool(row["deleted_after_scan"]),
         "threat": extra.get("threat", ""),
         "note": extra.get("note", ""),
+        "sha256": extra.get("sha256", ""),
     }
 
     if include_terminal:
@@ -474,7 +531,7 @@ def scan_regular_file(file_path: Path) -> dict:
     }
 
 
-def scan_extracted_archive(archive_path: Path, extract_dir: Path, original_filename: str = "") -> dict:
+def scan_extracted_archive(archive_path: Path, extract_dir: Path, original_filename: str = "", progress_callback=None) -> dict:
     lines = [
         "========== SCAN MODE ==========",
         "Archive extraction scan",
@@ -529,7 +586,16 @@ def scan_extracted_archive(archive_path: Path, extract_dir: Path, original_filen
     if not files:
         lines.append("No files found after extraction.")
 
-    for extracted_file in files:
+    if progress_callback:
+        progress_callback(
+            status="scanning",
+            message=f"Extraction complete. Scanning 0/{len(files)} extracted files.",
+            files_extracted=len(files),
+            files_scanned=0,
+            files_skipped_large=0,
+        )
+
+    for index, extracted_file in enumerate(files, start=1):
         relative_name = str(extracted_file.relative_to(extract_dir))
 
         try:
@@ -557,6 +623,15 @@ def scan_extracted_archive(archive_path: Path, extract_dir: Path, original_filen
 
         if result["status"] in {"clean", "infected"}:
             scanned_count += 1
+
+        if progress_callback and (index == len(files) or index % 5 == 0):
+            progress_callback(
+                status="scanning",
+                message=f"Scanning extracted files {index}/{len(files)}.",
+                files_extracted=len(files),
+                files_scanned=scanned_count,
+                files_skipped_large=skipped_large_count,
+            )
 
     fully_scanned = (not extraction_partial) and not limited and not failed and skipped_large_count == 0
 
@@ -613,6 +688,91 @@ def scan_extracted_archive(archive_path: Path, extract_dir: Path, original_filen
     }
 
 
+def run_scan_job(
+    scan_id: str,
+    file_path_text: str,
+    extract_dir_text: str,
+    display_name: str,
+    archive_mode: bool,
+    total_size: int,
+    sha256: str,
+) -> None:
+    file_path = Path(file_path_text)
+    extract_dir = Path(extract_dir_text)
+
+    def set_progress(status: str, message: str, files_extracted: int = 0, files_scanned: int = 0, files_skipped_large: int = 0) -> None:
+        update_scan_record(scan_id, {
+            "filename": display_name,
+            "size_bytes": total_size,
+            "status": status,
+            "message": message,
+            "fully_scanned": False,
+            "archive_detected": archive_mode,
+            "scan_mode": "archive_extract" if archive_mode else "direct",
+            "files_extracted": files_extracted,
+            "files_scanned": files_scanned,
+            "files_skipped_large": files_skipped_large,
+            "deleted_after_scan": False,
+            "terminal_output": message,
+            "note": "The uploaded file is temporarily kept only while the background scan runs.",
+            "sha256": sha256,
+        })
+
+    set_progress("extracting" if archive_mode else "scanning", "Background job started. Extracting archive..." if archive_mode else "Background job started. Scanning file...")
+
+    try:
+        if archive_mode:
+            result = scan_extracted_archive(
+                file_path,
+                extract_dir,
+                display_name,
+                progress_callback=set_progress,
+            )
+        else:
+            result = scan_regular_file(file_path)
+
+        result.update({
+            "filename": display_name,
+            "size_bytes": total_size,
+            "deleted_after_scan": True,
+            "archive_detected": archive_mode,
+            "sha256": sha256,
+            "note": "Only this scan record is stored. The uploaded file and extracted files were deleted after scanning.",
+        })
+
+        update_scan_record(scan_id, result)
+
+    except Exception as exc:
+        update_scan_record(scan_id, {
+            "filename": display_name,
+            "size_bytes": total_size,
+            "status": "scan_failed",
+            "message": f"Background scan crashed: {exc}",
+            "fully_scanned": False,
+            "archive_detected": archive_mode,
+            "scan_mode": "archive_extract" if archive_mode else "direct",
+            "files_extracted": 0,
+            "files_scanned": 0,
+            "files_skipped_large": 0,
+            "deleted_after_scan": True,
+            "terminal_output": f"ERROR: Background scan crashed: {exc}",
+            "note": "The uploaded file and extracted files were deleted after the failed scan attempt.",
+            "sha256": sha256,
+        })
+
+    finally:
+        try:
+            if file_path.exists():
+                file_path.unlink()
+        except Exception:
+            pass
+
+        try:
+            if extract_dir.exists():
+                shutil.rmtree(extract_dir, ignore_errors=True)
+        except Exception:
+            pass
+
 @app.get("/")
 def home():
     return FileResponse(static_dir / "index.html")
@@ -659,7 +819,7 @@ def clear_scans():
 
 
 @app.post("/api/scan")
-async def scan(file: UploadFile = File(...)):
+async def scan(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     if not wait_for_clamav(timeout_seconds=3):
         raise HTTPException(
             status_code=503,
@@ -668,58 +828,68 @@ async def scan(file: UploadFile = File(...)):
 
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-    random_id = uuid.uuid4().hex
-    file_path = UPLOAD_DIR / f"{random_id}.upload"
-    extract_dir = UPLOAD_DIR / f"{random_id}_extracted"
+    scan_id = uuid.uuid4().hex
+    file_path = UPLOAD_DIR / f"{scan_id}.upload"
+    extract_dir = UPLOAD_DIR / f"{scan_id}_extracted"
 
     display_name = safe_display_name(file.filename)
     archive_mode = is_archive(display_name)
 
     total = 0
+    sha256_hash = hashlib.sha256()
 
-    try:
-        with file_path.open("wb") as out:
-            while True:
-                chunk = await file.read(1024 * 1024)
-                if not chunk:
-                    break
+    with file_path.open("wb") as out:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
 
-                total += len(chunk)
-                if total > MAX_UPLOAD_BYTES:
-                    raise HTTPException(
-                        status_code=413,
-                        detail=f"File too large. Limit is {MAX_UPLOAD_MB} MB.",
-                    )
+            total += len(chunk)
+            sha256_hash.update(chunk)
+            if total > MAX_UPLOAD_BYTES:
+                try:
+                    file_path.unlink()
+                except Exception:
+                    pass
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"File too large. Limit is {MAX_UPLOAD_MB} MB.",
+                )
 
-                out.write(chunk)
+            out.write(chunk)
 
-        os.chmod(file_path, 0o644)
+    os.chmod(file_path, 0o644)
+    sha256 = sha256_hash.hexdigest()
 
-        result = scan_extracted_archive(file_path, extract_dir, display_name) if archive_mode else scan_regular_file(file_path)
+    queued_result = {
+        "filename": display_name,
+        "size_bytes": total,
+        "status": "queued",
+        "message": "Upload complete. Scan queued in the background. You can close this page now and come back later.",
+        "fully_scanned": False,
+        "archive_detected": archive_mode,
+        "scan_mode": "archive_extract" if archive_mode else "direct",
+        "files_extracted": 0,
+        "files_scanned": 0,
+        "files_skipped_large": 0,
+        "deleted_after_scan": False,
+        "terminal_output": "Upload complete. Background scan queued.",
+        "note": "The uploaded file is stored only while the background scan runs. It will be deleted after scanning.",
+        "sha256": sha256,
+    }
 
-        result.update({
-            "filename": display_name,
-            "size_bytes": total,
-            "deleted_after_scan": True,
-            "archive_detected": archive_mode,
-            "note": (
-                "Only this scan record is stored. The uploaded file and extracted files are deleted after scanning."
-            ),
-        })
+    save_scan_record(queued_result, scan_id=scan_id)
 
-        result["scan_id"] = save_scan_record(result)
+    background_tasks.add_task(
+        run_scan_job,
+        scan_id,
+        str(file_path),
+        str(extract_dir),
+        display_name,
+        archive_mode,
+        total,
+        sha256,
+    )
 
-        return JSONResponse(result)
-
-    finally:
-        try:
-            if file_path.exists():
-                file_path.unlink()
-        except Exception:
-            pass
-
-        try:
-            if extract_dir.exists():
-                shutil.rmtree(extract_dir, ignore_errors=True)
-        except Exception:
-            pass
+    queued_result["scan_id"] = scan_id
+    return JSONResponse(queued_result)
