@@ -1,25 +1,35 @@
-# Malware Checker v3
+# Malware Checker v10
 
-Plain black-and-white self-hosted malware checker with scan history.
+Plain black-and-white self-hosted malware checker with background scan jobs, upload progress, live scan status, scan history, and shield favicon.
 
-## Features
+## New in v10
 
-- Uses official RARLAB unrar for better RAR5 compatibility
+- Upload progress bar with percentage
+- Live scan status updates in Previous scans
+- Shows queued / extracting / scanning / final result
+- Shows SHA256 hash for each uploaded file
+- Better black/white buttons
+- Roboto Mono font
+- Larger text and larger title
 
-- Partial archive extraction still scans successfully extracted files
+## Existing features kept
 
+- Background scan jobs after upload completes
+- You can close the page after the upload is queued
+- Previous scan records persist in SQLite
 - Clear all saved scan records from the web UI
+- Uses official RARLAB unrar first for `.rar` files
+- Uses 7z / unar for other archive formats
+- Partial archive extraction still scans successfully extracted files
+- Uploaded files and extracted files are deleted after scanning
+- Only scan reports/history are stored
+- Shield favicon included
 
-- Black page with white text only
-- Extracts archives first, then scans extracted files one by one
-- Detects `.rar` by original filename and sends it straight to official RARLAB unrar
-- Uses 7z first only for non-RAR archives, then falls back to unar
-- Supports archive extensions like `.rar`, `.7z`, `.zip`, `.tar`, `.gz`, `.iso`
-- Shows terminal output in dropdowns
-- Stores previous scan records in SQLite
-- Does NOT store uploaded files
-- Deletes uploaded and extracted files after scan
-- Persistent history using Docker volume `scan-data`
+## Important behavior
+
+You must keep the browser tab open while the file is still uploading.
+
+After the upload finishes and the page says the scan is queued, the scan continues on the server in the background. You can close the page and come back later to see the result in Previous scans.
 
 ## Run
 
@@ -35,23 +45,6 @@ http://localhost:8088
 
 ## Stored data
 
-Only scan records are stored:
+The app stores only scan records in `/data/scan_history.sqlite3` inside the Docker volume `scan-data`.
 
-- filename
-- size
-- scan result
-- terminal output
-- timestamp
-- scan counts
-
-The actual uploaded file and extracted files are deleted after each scan.
-
-## Portainer
-
-Use this folder or Git repo as a Portainer Git stack.
-
-Compose path:
-
-```text
-docker-compose.yml
-```
+It does not permanently store uploaded files or extracted files.
