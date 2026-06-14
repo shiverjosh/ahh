@@ -1,9 +1,10 @@
-# Malware Checker v10
+# Malware Checker v11
 
 Plain black-and-white self-hosted malware checker with background scan jobs, upload progress, live scan status, scan history, and shield favicon.
 
-## New in v10
+## New in v11
 
+- Fixes previous-scan dropdown closing during auto-refresh
 - Upload progress bar with percentage
 - Live scan status updates in Previous scans
 - Shows queued / extracting / scanning / final result
