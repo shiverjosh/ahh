@@ -53,6 +53,50 @@ function isRunning(status) {
   return ["queued", "extracting", "scanning"].includes(status);
 }
 
+function scannedFilesVerdict(data) {
+  const threats = Array.isArray(data.threats) ? data.threats : [];
+  const failed = Array.isArray(data.failed) ? data.failed : [];
+  const limited = Array.isArray(data.limited) ? data.limited : [];
+
+  if (data.status === "infected" || threats.length > 0) {
+    return "Malware detected in scanned files.";
+  }
+
+  if ((data.files_scanned ?? 0) > 0) {
+    return `No malware detected by ClamAV in ${data.files_scanned} scanned files.`;
+  }
+
+  if (failed.length > 0 || limited.length > 0 || data.status === "scan_limited") {
+    return "No malware was reported, but there were no fully scanned files to confirm.";
+  }
+
+  return "No scan verdict available yet.";
+}
+
+function overallVerdict(data) {
+  if (data.status === "clean") {
+    return "Complete scan. No malware detected by ClamAV.";
+  }
+
+  if (data.status === "infected") {
+    return "Malware detected.";
+  }
+
+  if (data.status === "scan_limited") {
+    return "Incomplete scan. Some archive contents could not be scanned, so this is not a full clean result.";
+  }
+
+  if (data.status === "scan_failed") {
+    return "Scan failed. No reliable clean result.";
+  }
+
+  if (data.status === "queued" || data.status === "extracting" || data.status === "scanning") {
+    return "Scan is still running.";
+  }
+
+  return "Unknown result.";
+}
+
 function renderResult(data, titlePrefix = "Current scan", openTerminalIds = new Set()) {
   const output = data.terminal_output || data.raw || "";
   const terminalId = data.scan_id || data.id || "current";
@@ -65,6 +109,8 @@ function renderResult(data, titlePrefix = "Current scan", openTerminalIds = new 
     <p>File: ${escapeHtml(data.filename || selectedFile?.name || "Unknown")}</p>
     <p>Size: ${formatBytes(data.size_bytes || selectedFile?.size)}</p>
     <p>Status: ${escapeHtml(data.status || "unknown")}</p>
+    <p>Scanned files result: ${escapeHtml(scannedFilesVerdict(data))}</p>
+    <p>Overall result: ${escapeHtml(overallVerdict(data))}</p>
     <p>Fully scanned: ${data.fully_scanned === true ? "Yes" : "No"}</p>
     <p>Archive detected: ${data.archive_detected ? "Yes" : "No"}</p>
     <p>Scan mode: ${escapeHtml(data.scan_mode || "unknown")}</p>
