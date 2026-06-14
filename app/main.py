@@ -303,26 +303,73 @@ def finish_extraction_check(extract_dir: Path, output: str) -> dict:
 def extract_archive(archive_path: Path, extract_dir: Path, original_filename: str = "") -> dict:
     extract_dir.mkdir(parents=True, exist_ok=True)
 
-    # RAR files go straight to unar instead of trying 7z first.
+    # RAR files use official RARLAB unrar first. This has better RAR5 compatibility than 7z/unar.
     if is_rar_archive(original_filename):
-        unar_command = ["unar", "-force-overwrite", "-o", str(extract_dir), str(archive_path)]
-        unar = run_extractor(unar_command, "UNAR")
+        unrar_command = ["unrar", "x", "-o+", str(archive_path), str(extract_dir) + "/"]
+        unrar = run_extractor(unrar_command, "OFFICIAL UNRAR")
 
         output = "\n\n".join([
             "========== RAR DETECTED ==========",
-            "Original filename ends with .rar, so this scan used unar directly.",
+            "Original filename ends with .rar, so this scan used official RARLAB unrar first.",
             "",
-            "========== EXTRACTOR: UNAR ==========",
+            "========== EXTRACTOR: OFFICIAL UNRAR ==========",
+            unrar["output"],
+        ])
+
+        if unrar["ok"]:
+            checked = finish_extraction_check(extract_dir, output)
+            checked["partial"] = False
+            checked["partial_reason"] = ""
+            return checked
+
+        extracted_files = [p for p in extract_dir.rglob("*") if p.is_file() and not p.is_symlink()]
+        if extracted_files:
+            checked = finish_extraction_check(
+                extract_dir,
+                output + "\n\nWARNING: official unrar did not fully extract the archive, but some files were extracted and will be scanned."
+            )
+            checked["partial"] = True
+            checked["partial_reason"] = "official unrar failed to fully extract the archive; only successfully extracted files can be scanned."
+            return checked
+
+        # If official unrar extracts nothing usable, try unar as a fallback.
+        try:
+            shutil.rmtree(extract_dir, ignore_errors=True)
+            extract_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+        unar_command = ["unar", "-force-overwrite", "-o", str(extract_dir), str(archive_path)]
+        unar = run_extractor(unar_command, "UNAR FALLBACK")
+        output = "\n\n".join([
+            output,
+            "",
+            "========== EXTRACTOR FALLBACK: UNAR ==========",
             unar["output"],
         ])
 
         if not unar["ok"]:
+            extracted_files = [p for p in extract_dir.rglob("*") if p.is_file() and not p.is_symlink()]
+            if extracted_files:
+                checked = finish_extraction_check(
+                    extract_dir,
+                    output + "\n\nWARNING: fallback unar did not fully extract the archive, but some files were extracted and will be scanned."
+                )
+                checked["partial"] = True
+                checked["partial_reason"] = "all RAR extractors failed to fully extract the archive; only successfully extracted files can be scanned."
+                return checked
+
             return {
                 "ok": False,
-                "output": output + "\n\nERROR: unar failed to fully extract the RAR archive.",
+                "partial": False,
+                "partial_reason": "",
+                "output": output + "\n\nERROR: official unrar and fallback unar both failed to extract any usable files from the RAR archive.",
             }
 
-        return finish_extraction_check(extract_dir, output)
+        checked = finish_extraction_check(extract_dir, output)
+        checked["partial"] = False
+        checked["partial_reason"] = ""
+        return checked
 
     # Non-RAR archives use 7z first, then unar fallback.
     all_output = []
@@ -333,7 +380,10 @@ def extract_archive(archive_path: Path, extract_dir: Path, original_filename: st
     all_output.append(seven_zip["output"])
 
     if seven_zip["ok"]:
-        return finish_extraction_check(extract_dir, "\n\n".join(all_output))
+        checked = finish_extraction_check(extract_dir, "\n\n".join(all_output))
+        checked["partial"] = False
+        checked["partial_reason"] = ""
+        return checked
 
     # Clean partial files before fallback so we do not scan incomplete extraction output.
     try:
@@ -349,12 +399,27 @@ def extract_archive(archive_path: Path, extract_dir: Path, original_filename: st
     all_output.append(unar["output"])
 
     if not unar["ok"]:
+        extracted_files = [p for p in extract_dir.rglob("*") if p.is_file() and not p.is_symlink()]
+        if extracted_files:
+            checked = finish_extraction_check(
+                extract_dir,
+                "\n\n".join(all_output) + "\n\nWARNING: Extractors did not fully extract the archive, but some files were extracted and will be scanned."
+            )
+            checked["partial"] = True
+            checked["partial_reason"] = "archive extraction was partial; only successfully extracted files can be scanned."
+            return checked
+
         return {
             "ok": False,
-            "output": "\n\n".join(all_output) + "\n\nERROR: Both 7z and unar failed to fully extract the archive.",
+            "partial": False,
+            "partial_reason": "",
+            "output": "\n\n".join(all_output) + "\n\nERROR: Both 7z and unar failed to extract any usable files.",
         }
 
-    return finish_extraction_check(extract_dir, "\n\n".join(all_output))
+    checked = finish_extraction_check(extract_dir, "\n\n".join(all_output))
+    checked["partial"] = False
+    checked["partial_reason"] = ""
+    return checked
 
 
 def scan_regular_file(file_path: Path) -> dict:
@@ -439,11 +504,17 @@ def scan_extracted_archive(archive_path: Path, extract_dir: Path, original_filen
             "scan_mode": "archive_extract",
         }
 
+    extraction_partial = bool(extraction.get("partial"))
+    extraction_partial_reason = extraction.get("partial_reason", "")
+
     files = [p for p in extract_dir.rglob("*") if p.is_file() and not p.is_symlink()]
 
     infected = []
     limited = []
     failed = []
+
+    if extraction_partial:
+        limited.append(extraction_partial_reason or "Archive extraction was partial; some files were not scanned.")
     scanned_count = 0
     skipped_large_count = 0
 
@@ -487,14 +558,17 @@ def scan_extracted_archive(archive_path: Path, extract_dir: Path, original_filen
         if result["status"] in {"clean", "infected"}:
             scanned_count += 1
 
-    fully_scanned = not limited and not failed and skipped_large_count == 0
+    fully_scanned = (not extraction_partial) and not limited and not failed and skipped_large_count == 0
 
     if infected:
         status = "infected"
         message = "Malware detected in extracted archive contents."
     elif limited or skipped_large_count:
         status = "scan_limited"
-        message = "Archive was extracted, but some files could not be fully scanned."
+        if extraction_partial:
+            message = "Archive was partially extracted. Successfully extracted files were scanned, but some files were not available to scan."
+        else:
+            message = "Archive was extracted, but some files could not be fully scanned."
     elif failed:
         status = "scan_failed"
         message = "Archive was extracted, but one or more scans failed."
@@ -507,6 +581,7 @@ def scan_extracted_archive(archive_path: Path, extract_dir: Path, original_filen
         "========== PARSED RESULT ==========",
         f"Status: {status}",
         f"Fully scanned: {'Yes' if fully_scanned else 'No'}",
+        f"Extraction partial: {'Yes' if extraction_partial else 'No'}",
         f"Files extracted: {len(files)}",
         f"Files scanned: {scanned_count}",
         f"Files skipped large: {skipped_large_count}",
