@@ -81,17 +81,28 @@ function renderResult(data, titlePrefix = "Current scan") {
   `;
 }
 
+function getOpenHistoryIds() {
+  return new Set(
+    [...historyBox.querySelectorAll("details[data-id][open]")]
+      .map((details) => details.dataset.id)
+  );
+}
+
 function renderHistory(records) {
   if (!records.length) {
     historyBox.innerHTML = "<p>No previous scans.</p>";
     return;
   }
 
+  const openIds = getOpenHistoryIds();
+
   historyBox.innerHTML = records.map((record) => {
     const runningClass = isRunning(record.status) ? " status-running" : "";
+    const shouldStayOpen = openIds.has(record.id) || isRunning(record.status);
+
     return `
       <article class="record${runningClass}">
-        <details ${isRunning(record.status) ? "open" : ""}>
+        <details data-id="${escapeHtml(record.id)}" ${shouldStayOpen ? "open" : ""}>
           <summary>
             ${escapeHtml(label(record.status))} |
             ${escapeHtml(record.filename)} |
